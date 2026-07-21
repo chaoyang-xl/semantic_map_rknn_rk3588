@@ -188,7 +188,11 @@ sleep 0.2
 
 while true; do
   sample_cpu
-  if ! $no_clear && ! $run_once; then
+
+  if $dashboard_mode; then
+    tput home
+    tput ed
+  elif ! $no_clear && ! $run_once; then
     printf '\033[H\033[2J'
   fi
 
