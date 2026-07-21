@@ -211,7 +211,9 @@ python3 scripts/view_objects_2d.py \
 The repository includes a dependency-free, full-screen monitor for OrangePi 5
 Plus. It reports per-core CPU utilization and frequency, RK3588 NPU core load,
 Mali GPU load, thermal zones, RAM, swap, storage, and the busiest processes.
-The dashboard refreshes in place instead of scrolling the terminal.
+The compact dashboard uses the terminal alternate screen and refreshes in place,
+so normal monitoring does not grow the terminal scrollback. OrangePi's eight CPU
+cores occupy two rows. Use `--no-clear` only when an appended log is required.
 
 ```bash
 cd /home/orangepi/ros2_ws/src/semantic_map_rknn_rk3588

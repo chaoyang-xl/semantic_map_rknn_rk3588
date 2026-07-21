@@ -8,6 +8,7 @@ export LC_ALL=C
 interval=2
 run_once=false
 no_clear=false
+dashboard_active=false
 
 usage() {
   cat <<'EOF'
@@ -95,24 +96,19 @@ cpu_frequency_khz() {
 }
 
 print_cpu() {
-  local cpu type freq governor cpu_count cpu_path
+  local cpu freq cpu_count
   cpu_count=$(nproc)
   echo "[CPU - interval utilization]"
   for ((cpu = 0; cpu < cpu_count; cpu++)); do
-    cpu_path="/sys/devices/system/cpu/cpu${cpu}"
-    if ((cpu_count == 8)); then
-      ((cpu < 4)) && type="A55" || type="A76"
-    else
-      type="CPU"
-    fi
     freq=$(cpu_frequency_khz "$cpu")
-    governor="-"
-    [[ -r "$cpu_path/cpufreq/scaling_governor" ]] && \
-      governor=$(<"$cpu_path/cpufreq/scaling_governor")
-    printf "  cpu%-2d %-3s  %4d MHz  %3d%%  %-11s\n" \
-      "$cpu" "$type" "$((freq / 1000))" "${cpu_usage[$cpu]:-0}" "$governor"
+    ((cpu % 4 == 0)) && printf "  "
+    printf "c%d:%3d%%/%4dM  " \
+      "$cpu" "${cpu_usage[$cpu]:-0}" "$((freq / 1000))"
+    if ((cpu % 4 == 3 || cpu == cpu_count - 1)); then
+      printf "\n"
+    fi
   done
-  printf "  load average: %s\n" "$(cut -d' ' -f1-3 /proc/loadavg)"
+  printf "  load average: %s\n" "$(cut -d" " -f1-3 /proc/loadavg)"
 }
 
 print_npu() {
@@ -150,15 +146,23 @@ print_gpu() {
 }
 
 print_temperatures() {
-  local zone type temp
+  local zone type temp max_temp=-1 max_type="unavailable"
   echo "[Temperature]"
   for zone in /sys/class/thermal/thermal_zone*; do
     [[ -r $zone/type && -r $zone/temp ]] || continue
     type=$(<"$zone/type")
     temp=$(<"$zone/temp")
-    awk -v label="$type" -v value="$temp" \
-      'BEGIN { printf "  %-24s %5.1f C\n", label, value / 1000 }'
+    if ((temp > max_temp)); then
+      max_temp=$temp
+      max_type=$type
+    fi
   done
+  if ((max_temp >= 0)); then
+    awk -v label="$max_type" -v value="$max_temp" \
+      "BEGIN { printf \"  hottest: %-20s %5.1f C\\n\", label, value / 1000 }"
+  else
+    echo "  unavailable"
+  fi
 }
 
 print_memory_and_disk() {
@@ -175,7 +179,7 @@ print_processes() {
   echo "[Top processes]"
   printf "  %-7s %-22s %6s %6s %8s\n" PID COMMAND CPU% MEM% RSS
   ps -eo pid=,comm=,%cpu=,%mem=,rss= --sort=-%cpu | \
-    awk -v self="$$" '$1 != self && $2 != "ps" && $2 != "awk" && shown < 6 {
+    awk -v self="$$" '$1 != self && $2 != "ps" && $2 != "awk" && shown < 4 {
       printf "  %-7s %-22.22s %6s %6s %7.1fM\n", $1, $2, $3, $4, $5/1024
       shown++
     }'
@@ -185,6 +189,22 @@ print_processes() {
 # than the misleading average CPU utilization since boot.
 sample_cpu
 sleep 0.2
+
+restore_terminal() {
+  if $dashboard_active; then
+    printf "\033[?25h\033[?1049l"
+    dashboard_active=false
+  fi
+}
+
+if ! $no_clear && ! $run_once && [[ -t 1 ]]; then
+  dashboard_active=true
+  trap restore_terminal EXIT
+  trap "restore_terminal; exit 0" INT TERM HUP
+  printf "\033[?1049h\033[?25l"
+elif [[ ! -t 1 ]]; then
+  no_clear=true
+fi
 
 while true; do
   sample_cpu
