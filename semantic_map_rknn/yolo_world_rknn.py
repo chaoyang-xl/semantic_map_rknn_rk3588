@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import itertools
+import os
 
 import cv2
 import numpy as np
@@ -97,6 +98,10 @@ class YoloWorldRknn:
         tokenizer_path: str,
         **session_options,
     ) -> np.ndarray:
+        # Only tokenization is needed; avoid importing an installed Torch stack.
+        os.environ["USE_TORCH"] = "0"
+        os.environ["USE_TF"] = "0"
+        os.environ["USE_FLAX"] = "0"
         try:
             from transformers import AutoTokenizer
         except ImportError as exc:
