@@ -172,6 +172,7 @@ python3 scripts/evaluate_rknn_projection_tracking.py \
   --sam-encoder /home/orangepi/models/mobile_sam/mobilesam_encoder_tiny.rknn \
   --sam-decoder /home/orangepi/models/mobile_sam/mobilesam_decoder.rknn \
   --frames 0 \
+  --frame-step 2 \
   --confidence 0.50 \
   --min-depth 0.3 \
   --max-depth 5.0 \
@@ -179,6 +180,10 @@ python3 scripts/evaluate_rknn_projection_tracking.py \
   --min-confirmed-observations 8 \
   --progress-every 10
 ```
+
+`--frame-step 2` processes source frames `0, 2, 4, ...` while preserving
+each selected frame's original pose and file index. `--frames` still limits the number
+of processed frames; use `--frame-step 1` for the full sequence.
 
 If detection JSON is absent, additionally provide:
 

@@ -16,6 +16,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--output", type=Path, required=True)
     result.add_argument("--start", type=int, default=0)
     result.add_argument("--frames", type=int, default=0)
+    result.add_argument(
+        "--frame-step", type=int, default=1,
+        help="Process every Nth source frame; --frames counts processed frames",
+    )
     result.add_argument("--sam-encoder", type=Path, required=True)
     result.add_argument("--sam-decoder", type=Path, required=True)
     result.add_argument("--yolo-model", type=Path)

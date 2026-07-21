@@ -102,8 +102,11 @@ def run_dataset(args) -> dict:
         float(camera["fx"]), float(camera["fy"]),
         float(camera["cx"]), float(camera["cy"]),
     )
+    frame_step = int(getattr(args, "frame_step", 1))
+    if frame_step < 1:
+        raise ValueError("frame_step must be at least 1")
     frame_ids = []
-    for index in range(args.start, len(poses)):
+    for index in range(args.start, len(poses), frame_step):
         if not (data_root / "results" / f"frame{index:06d}.jpg").is_file():
             break
         if not (data_root / "results" / f"depth{index:06d}.png").is_file():
@@ -266,7 +269,12 @@ def run_dataset(args) -> dict:
         object_records,
         frame_id="map",
         source="semantic_map_rknn",
-        metadata={"frame_start": args.start, "frame_count": len(frame_ids)},
+        metadata={
+            "frame_start": args.start,
+            "frame_count": len(frame_ids),
+            "frame_step": frame_step,
+            "frame_last": frame_ids[-1],
+        },
     )
     (output / "associations.json").write_text(
         json.dumps(association_records, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -274,6 +282,8 @@ def run_dataset(args) -> dict:
     summary = {
         "frame_start": args.start,
         "frame_count": len(frame_ids),
+        "frame_step": frame_step,
+        "frame_last": frame_ids[-1],
         "detection_source": "exported_json" if use_exported else "rknn_yolo_world",
         "input_detections": input_detections,
         "projected_detections": projected_detections,
