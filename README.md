@@ -206,6 +206,33 @@ python3 scripts/view_objects_2d.py \
 - Camera intrinsics must match the depth image used for projection.
 - The default valid depth range is 0.3-5.0 m.
 
+## RK3588 Performance Monitor
+
+The repository includes a dependency-free, full-screen monitor for OrangePi 5
+Plus. It reports per-core CPU utilization and frequency, RK3588 NPU core load,
+Mali GPU load, thermal zones, RAM, swap, storage, and the busiest processes.
+The dashboard refreshes in place instead of scrolling the terminal.
+
+```bash
+cd /home/orangepi/ros2_ws/src/semantic_map_rknn_rk3588
+sudo ./scripts/monitor_rk3588.sh --interval 1
+```
+
+Useful diagnostic modes:
+
+```bash
+# One sample for an issue report
+sudo ./scripts/monitor_rk3588.sh --once
+
+# Append samples instead of clearing the screen
+sudo ./scripts/monitor_rk3588.sh --interval 2 --no-clear | tee performance.log
+```
+
+Running with `sudo` is recommended because the Rockchip NPU load is exposed at
+`/sys/kernel/debug/rknpu/load`. Without permission, all other readable metrics
+remain available. `btop` can be used as a complementary general Linux monitor,
+but it does not replace the RK3588-specific NPU section in this script.
+
 ## Performance
 
 MobileSAM runs the encoder once per processed image and the decoder once per
