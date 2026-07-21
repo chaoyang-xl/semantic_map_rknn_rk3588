@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+install/
+log/
+outputs/
+models/
+*.rknn
+*.onnx
+*.pt
+*.npz
+*.ply
