@@ -75,7 +75,16 @@ class MobileSamRknn:
         outputs = self.encoder.inference([encoder_input])
         if not outputs:
             raise RuntimeError("MobileSAM encoder returned no output")
-        self._embedding = np.asarray(outputs[0])
+        embedding = np.asarray(outputs[0], dtype=np.float32)
+        if embedding.ndim != 4:
+            raise RuntimeError(f"Unexpected MobileSAM embedding shape: {embedding.shape}")
+        # The decoder RKNN model consumes image_embeddings as NHWC. Convert the
+        # encoder output once per image instead of inside every box call.
+        if embedding.shape[1] == 256:
+            embedding = np.transpose(embedding, (0, 2, 3, 1))
+        elif embedding.shape[-1] != 256:
+            raise RuntimeError(f"Unexpected MobileSAM embedding shape: {embedding.shape}")
+        self._embedding = np.ascontiguousarray(embedding)
         self._original_shape = tuple(int(value) for value in rgb.shape[:2])
         self._resized_shape = resized_shape
 
@@ -101,12 +110,12 @@ class MobileSamRknn:
             coords[..., 1] *= self._resized_shape[0] / float(height)
             labels = np.asarray([[2.0, 3.0]], dtype=np.float32)
             mask_input = np.zeros(
-                (1, 1, self.low_res_size, self.low_res_size), dtype=np.float32
+                (1, self.low_res_size, self.low_res_size, 1), dtype=np.float32
             )
             has_mask = np.zeros((1,), dtype=np.float32)
             outputs = self.decoder.inference(
                 [self._embedding, coords, labels, mask_input, has_mask],
-                data_format="NCHW",
+                data_format=["nhwc", "nchw", "nchw", "nhwc", "nchw"],
             )
             scores, low_res_masks = self._identify_decoder_outputs(outputs)
             mask, score = self._postprocess(scores, low_res_masks)

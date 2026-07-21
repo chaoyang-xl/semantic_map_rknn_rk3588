@@ -51,8 +51,10 @@ def test_preprocess_and_official_decoder_postprocess():
         [[[70.0, 84.0], [350.0, 280.0]]],
     )
     np.testing.assert_array_equal(decoder_inputs[2], [[2.0, 3.0]])
-    assert decoder_inputs[3].shape == (1, 1, 112, 112)
-    assert data_format == "NCHW"
+    assert decoder_inputs[0].shape == (1, 28, 28, 256)
+    assert decoder_inputs[0].flags.c_contiguous
+    assert decoder_inputs[3].shape == (1, 112, 112, 1)
+    assert data_format == ["nhwc", "nchw", "nchw", "nhwc", "nchw"]
 
 
 def test_nhwc_decoder_masks_are_accepted():
