@@ -5,6 +5,7 @@ import numpy as np
 from semantic_map_rknn.object_tracker import (
     ObjectObservation,
     ObjectTracker,
+    merge_voxel_clouds,
     nearest_neighbor_overlap,
     voxel_downsample_with_colors,
 )
@@ -61,12 +62,32 @@ def test_nearest_overlap_accepts_shifted_surfaces():
     assert nearest_neighbor_overlap(first, shifted, 0.03) > 0.8
 
 
+def test_nearest_overlap_rejects_empty_cloud():
+    empty = np.empty((0, 3), dtype=np.float32)
+    points = observation(0, [0, 0, 1]).points
+    assert nearest_neighbor_overlap(empty, points, 0.03) == 0.0
+
+
 def test_same_object_is_associated_and_confirmed():
     mapping = tracker()
     first = mapping.update([observation(0, [0, 0, 1], stamp=1.0)])[0]
     second = mapping.update([observation(0, [0.01, 0, 1], stamp=2.0)])[0]
     assert first.track_id == second.track_id
     assert mapping.tracks[first.track_id].status == "confirmed"
+
+
+def test_track_geometry_cache_invalidates_after_merge():
+    mapping = tracker()
+    track_id = mapping.update(
+        [observation(0, [0, 0, 1], stamp=1.0)]
+    )[0].track_id
+    track = mapping.tracks[track_id]
+    initial_geometry = track.geometry
+
+    mapping.update([observation(0, [0.01, 0, 1], stamp=2.0)])
+
+    assert track.geometry is not initial_geometry
+    np.testing.assert_allclose(track.geometry.centroid, np.mean(track.points, axis=0))
 
 
 def test_global_assignment_prevents_double_use_of_one_track():
@@ -132,46 +153,6 @@ def test_periodic_map_merge_removes_duplicate_tracks():
     assert len(mapping.tracks) == 1
 
 
-def test_parallel_tracker_matches_serial_results():
-    serial = tracker(worker_count=1, denoise_interval=1)
-    parallel = tracker(worker_count=4, denoise_interval=1)
-    frames = [
-        [
-            observation(0, [0, 0, 1], stamp=1.0),
-            observation(1, [1, 0, 1], stamp=1.0),
-        ],
-        [
-            observation(0, [0.01, 0, 1], stamp=2.0),
-            observation(1, [1.01, 0, 1], stamp=2.0),
-        ],
-        [
-            observation(0, [0.02, 0, 1], stamp=3.0),
-            observation(1, [1.02, 0, 1], stamp=3.0),
-        ],
-    ]
-    try:
-        for items in frames:
-            serial_matches = serial.update(items)
-            parallel_matches = parallel.update(items)
-            assert [
-                (item.observation_index, item.track_id, item.is_new)
-                for item in parallel_matches
-            ] == [
-                (item.observation_index, item.track_id, item.is_new)
-                for item in serial_matches
-            ]
-        assert parallel.worker_count == 4
-        assert sorted(parallel.tracks) == sorted(serial.tracks)
-        for track_id in serial.tracks:
-            serial_track = serial.tracks[track_id]
-            parallel_track = parallel.tracks[track_id]
-            assert parallel_track.observation_count == serial_track.observation_count
-            np.testing.assert_allclose(parallel_track.points, serial_track.points)
-    finally:
-        serial.close()
-        parallel.close()
-
-
 def test_voxel_downsample_preserves_rgb_alignment():
     points = np.asarray([[0.01, 0, 0], [0.02, 0, 0]], dtype=np.float32)
     colors = np.asarray([[100, 20, 0], [200, 40, 10]], dtype=np.uint8)
@@ -180,3 +161,34 @@ def test_voxel_downsample_preserves_rgb_alignment():
     )
     assert sampled_points.shape == sampled_colors.shape == (1, 3)
     np.testing.assert_array_equal(sampled_colors[0], [150, 30, 5])
+
+
+def test_fast_voxel_merge_matches_full_downsample():
+    rng = np.random.default_rng(42)
+    voxel_size = 0.05
+    first_points, first_colors = voxel_downsample_with_colors(
+        rng.uniform(-2.0, 2.0, size=(500, 3)).astype(np.float32),
+        rng.integers(0, 256, size=(500, 3), dtype=np.uint8),
+        voxel_size,
+    )
+    second_points, second_colors = voxel_downsample_with_colors(
+        rng.uniform(-2.0, 2.0, size=(500, 3)).astype(np.float32),
+        rng.integers(0, 256, size=(500, 3), dtype=np.uint8),
+        voxel_size,
+    )
+
+    expected_points, expected_colors = voxel_downsample_with_colors(
+        np.concatenate((first_points, second_points)),
+        np.concatenate((first_colors, second_colors)),
+        voxel_size,
+    )
+    actual_points, actual_colors = merge_voxel_clouds(
+        first_points,
+        first_colors,
+        second_points,
+        second_colors,
+        voxel_size,
+    )
+
+    np.testing.assert_array_equal(actual_points, expected_points)
+    np.testing.assert_array_equal(actual_colors, expected_colors)

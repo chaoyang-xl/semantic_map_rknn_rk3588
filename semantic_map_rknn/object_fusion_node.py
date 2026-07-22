@@ -56,7 +56,6 @@ class ObjectFusionNode(Node):
             "denoise_interval": 20,
             "map_merge_interval": 20,
             "map_merge_overlap": 0.80,
-            "fusion_workers": 1,
             "min_confirmed_observations": 3,
             "candidate_max_missed_frames": 30,
             "stale_after_s": 0.0,
@@ -72,7 +71,7 @@ class ObjectFusionNode(Node):
             "association_threshold", "geometry_weight", "semantic_weight",
             "observation_cluster_eps", "observation_cluster_min_points",
             "max_extent_growth", "denoise_interval", "map_merge_interval",
-            "map_merge_overlap", "fusion_workers", "min_confirmed_observations",
+            "map_merge_overlap", "min_confirmed_observations",
             "candidate_max_missed_frames", "stale_after_s",
         )
         self._fusion = ObjectTracker(**{
@@ -119,10 +118,6 @@ class ObjectFusionNode(Node):
             "Object tracker ready: nearest-neighbour geometry + semantic history, "
             f"non_fusing={sorted(self._non_fusing_labels)}"
         )
-
-    def destroy_node(self):
-        self._fusion.close()
-        return super().destroy_node()
 
     def _cloud_cb(self, msg: PointCloud2) -> None:
         key = self._stamp_key(msg.header.stamp)

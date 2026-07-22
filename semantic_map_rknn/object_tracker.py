@@ -2,12 +2,40 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
 import numpy as np
 
 from .spatial_filter import largest_spatial_cluster_indices
+
+
+@dataclass(frozen=True)
+class GeometryIndex:
+    """Reusable geometric summaries and nearest-neighbour index for one cloud."""
+
+    points: np.ndarray
+    centroid: np.ndarray
+    low: np.ndarray
+    high: np.ndarray
+    tree: object | None
+
+
+def build_geometry_index(points: np.ndarray) -> GeometryIndex:
+    """Build geometric summaries once for repeated association checks."""
+    point_array = np.asarray(points, dtype=np.float32)
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        tree = None
+    else:
+        tree = cKDTree(point_array)
+    return GeometryIndex(
+        points=point_array,
+        centroid=np.mean(point_array, axis=0),
+        low=np.min(point_array, axis=0),
+        high=np.max(point_array, axis=0),
+        tree=tree,
+    )
 
 
 @dataclass(frozen=True)
@@ -45,14 +73,24 @@ class TrackedObject:
     class_names: dict[int, str] = field(default_factory=dict)
     missed_frames: int = 0
     status: str = "candidate"
+    _geometry: GeometryIndex | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    @property
+    def geometry(self) -> GeometryIndex:
+        if self._geometry is None or self._geometry.points is not self.points:
+            self._geometry = build_geometry_index(self.points)
+        return self._geometry
 
     @property
     def centroid(self) -> np.ndarray:
-        return np.mean(self.points, axis=0)
+        return self.geometry.centroid
 
     @property
     def bounds(self) -> tuple[np.ndarray, np.ndarray]:
-        return np.min(self.points, axis=0), np.max(self.points, axis=0)
+        geometry = self.geometry
+        return geometry.low, geometry.high
 
 
 @dataclass(frozen=True)
@@ -106,44 +144,150 @@ def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
     return voxel_downsample_with_colors(points, None, voxel_size)[0]
 
 
-def nearest_neighbor_overlap(
-    points_a: np.ndarray, points_b: np.ndarray, radius: float
+def _packed_voxel_codes(points: np.ndarray, voxel_size: float) -> np.ndarray | None:
+    """Pack signed XYZ voxel keys into sortable int64 values."""
+    keys = np.floor(np.asarray(points, dtype=np.float32) / voxel_size).astype(np.int64)
+    bias = 1 << 20
+    if np.any(keys < -bias) or np.any(keys >= bias):
+        return None
+    shifted = keys + bias
+    return (shifted[:, 0] << 42) | (shifted[:, 1] << 21) | shifted[:, 2]
+
+
+def merge_voxel_clouds(
+    existing_points: np.ndarray,
+    existing_colors: np.ndarray | None,
+    incoming_points: np.ndarray,
+    incoming_colors: np.ndarray | None,
+    voxel_size: float,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Merge two already-voxelized clouds without regrouping all XYZ keys."""
+    first = np.asarray(existing_points, dtype=np.float32)
+    second = np.asarray(incoming_points, dtype=np.float32)
+    first_codes = _packed_voxel_codes(first, voxel_size)
+    second_codes = _packed_voxel_codes(second, voxel_size)
+    if (
+        first_codes is None
+        or second_codes is None
+        or np.any(first_codes[1:] <= first_codes[:-1])
+        or np.any(second_codes[1:] <= second_codes[:-1])
+    ):
+        colors = (
+            np.concatenate((existing_colors, incoming_colors))
+            if existing_colors is not None and incoming_colors is not None
+            else None
+        )
+        return voxel_downsample_with_colors(
+            np.concatenate((first, second)), colors, voxel_size
+        )
+
+    output_codes = np.union1d(first_codes, second_codes)
+    first_output = np.searchsorted(output_codes, first_codes)
+    second_output = np.searchsorted(output_codes, second_codes)
+    first_lookup = np.searchsorted(first_codes, second_codes)
+    matched = first_lookup < first_codes.size
+    candidates = np.flatnonzero(matched)
+    matched[candidates] = (
+        first_codes[first_lookup[candidates]] == second_codes[candidates]
+    )
+
+    points = np.empty((output_codes.size, 3), dtype=np.float32)
+    points[first_output] = first
+    points[second_output[~matched]] = second[~matched]
+    if np.any(matched):
+        points[second_output[matched]] = (
+            (
+                first[first_lookup[matched]].astype(np.float64)
+                + second[matched].astype(np.float64)
+            )
+            * 0.5
+        ).astype(np.float32)
+
+    if existing_colors is None or incoming_colors is None:
+        return points, None
+    first_colors = np.asarray(existing_colors, dtype=np.uint8)
+    second_colors = np.asarray(incoming_colors, dtype=np.uint8)
+    colors = np.empty((output_codes.size, 3), dtype=np.uint8)
+    colors[first_output] = first_colors
+    colors[second_output[~matched]] = second_colors[~matched]
+    if np.any(matched):
+        colors[second_output[matched]] = np.rint(
+            (
+                first_colors[first_lookup[matched]].astype(np.float64)
+                + second_colors[matched].astype(np.float64)
+            )
+            * 0.5
+        ).clip(0, 255).astype(np.uint8)
+    return points, colors
+
+
+def geometry_overlap(
+    first: GeometryIndex, second: GeometryIndex, radius: float
 ) -> float:
-    """Return the larger bidirectional fraction with a neighbour inside radius."""
-    if points_a.size == 0 or points_b.size == 0 or radius <= 0.0:
+    """Return bidirectional nearest-neighbour overlap using reusable indices."""
+    if first.points.size == 0 or second.points.size == 0 or radius <= 0.0:
         return 0.0
-    try:
-        from scipy.spatial import cKDTree
-    except ImportError:
+    if first.tree is None or second.tree is None:
         keys_a = {
             tuple(key)
-            for key in np.floor(np.asarray(points_a) / radius).astype(np.int64)
+            for key in np.floor(first.points / radius).astype(np.int64)
         }
         keys_b = {
             tuple(key)
-            for key in np.floor(np.asarray(points_b) / radius).astype(np.int64)
+            for key in np.floor(second.points / radius).astype(np.int64)
         }
         intersection = len(keys_a & keys_b)
         return max(intersection / len(keys_a), intersection / len(keys_b))
 
-    a = np.asarray(points_a, dtype=np.float32)
-    b = np.asarray(points_b, dtype=np.float32)
-    distance_a, _ = cKDTree(b).query(a, k=1)
-    distance_b, _ = cKDTree(a).query(b, k=1)
+    distance_a, _ = second.tree.query(
+        first.points, k=1, distance_upper_bound=radius
+    )
+    distance_b, _ = first.tree.query(
+        second.points, k=1, distance_upper_bound=radius
+    )
     return float(max(np.mean(distance_a <= radius), np.mean(distance_b <= radius)))
+
+
+def nearest_neighbor_overlap(
+    points_a: np.ndarray, points_b: np.ndarray, radius: float
+) -> float:
+    """Return the larger bidirectional fraction with a neighbour inside radius."""
+    if (
+        np.asarray(points_a).size == 0
+        or np.asarray(points_b).size == 0
+        or radius <= 0.0
+    ):
+        return 0.0
+    return geometry_overlap(
+        build_geometry_index(points_a),
+        build_geometry_index(points_b),
+        radius,
+    )
+
+
+def geometry_aabb_overlap(first: GeometryIndex, second: GeometryIndex) -> float:
+    """Return intersection volume divided by the smaller AABB volume."""
+    intersection = float(
+        np.prod(
+            np.maximum(
+                0.0,
+                np.minimum(first.high, second.high)
+                - np.maximum(first.low, second.low),
+            )
+        )
+    )
+    extent_a = np.maximum(first.high - first.low, 0.02)
+    extent_b = np.maximum(second.high - second.low, 0.02)
+    denominator = min(float(np.prod(extent_a)), float(np.prod(extent_b)))
+    return intersection / denominator if denominator > 0.0 else 0.0
 
 
 def aabb_overlap_ratio(points_a: np.ndarray, points_b: np.ndarray) -> float:
     """Return intersection volume divided by the smaller AABB volume."""
-    low_a, high_a = np.min(points_a, axis=0), np.max(points_a, axis=0)
-    low_b, high_b = np.min(points_b, axis=0), np.max(points_b, axis=0)
-    intersection = float(
-        np.prod(np.maximum(0.0, np.minimum(high_a, high_b) - np.maximum(low_a, low_b)))
+    return geometry_aabb_overlap(
+        build_geometry_index(points_a),
+        build_geometry_index(points_b),
     )
-    extent_a = np.maximum(high_a - low_a, 0.02)
-    extent_b = np.maximum(high_b - low_b, 0.02)
-    denominator = min(float(np.prod(extent_a)), float(np.prod(extent_b)))
-    return intersection / denominator if denominator > 0.0 else 0.0
 
 
 def semantic_similarity(
@@ -180,7 +324,6 @@ class ObjectTracker:
         min_confirmed_observations: int = 3,
         candidate_max_missed_frames: int = 30,
         stale_after_s: float = 0.0,
-        worker_count: int = 1,
     ) -> None:
         if voxel_size <= 0.0 or overlap_radius <= 0.0:
             raise ValueError("voxel_size and overlap_radius must be positive")
@@ -206,24 +349,9 @@ class ObjectTracker:
         self.min_confirmed_observations = max(1, int(min_confirmed_observations))
         self.candidate_max_missed_frames = max(0, int(candidate_max_missed_frames))
         self.stale_after_s = max(0.0, float(stale_after_s))
-        self.worker_count = max(1, int(worker_count))
-        self._executor = (
-            ThreadPoolExecutor(
-                max_workers=self.worker_count,
-                thread_name_prefix="semantic-fusion",
-            )
-            if self.worker_count > 1
-            else None
-        )
         self.tracks: dict[int, TrackedObject] = {}
         self._next_track_id = 1
         self._frame_count = 0
-
-    def _parallel_map(self, function, items: list):
-        """Run independent CPU jobs in stable input order."""
-        if self._executor is None or len(items) < 2:
-            return [function(item) for item in items]
-        return list(self._executor.map(function, items))
 
     @property
     def confirmed_tracks(self) -> dict[int, TrackedObject]:
@@ -242,25 +370,17 @@ class ObjectTracker:
 
         cleaned = []
         source_indices = []
-        cleaned_items = self._parallel_map(self._clean_observation, observations)
-        for source_index, item in enumerate(cleaned_items):
+        for source_index, observation in enumerate(observations):
+            item = self._clean_observation(observation)
             if item is not None:
                 cleaned.append(item)
                 source_indices.append(source_index)
         assignments = self._assign(cleaned)
         matched_observations = {item.observation_index for item in assignments}
 
-        merge_jobs = [
-            (
-                self.tracks[association.track_id],
-                cleaned[association.observation_index],
-            )
-            for association in assignments
-        ]
-        self._parallel_map(
-            lambda job: self._merge_observation(job[0], job[1]),
-            merge_jobs,
-        )
+        for association in assignments:
+            track = self.tracks[association.track_id]
+            self._merge_observation(track, cleaned[association.observation_index])
 
         results = list(assignments)
         for index, observation in enumerate(cleaned):
@@ -299,19 +419,6 @@ class ObjectTracker:
         self._merge_duplicate_tracks()
         self.tracks = dict(self.confirmed_tracks)
 
-    def close(self) -> None:
-        """Wait for fusion workers and release their threads."""
-        executor = self._executor
-        self._executor = None
-        if executor is not None:
-            executor.shutdown(wait=True)
-
-    def __del__(self) -> None:  # pragma: no cover - best-effort process cleanup
-        try:
-            self.close()
-        except Exception:
-            pass
-
     def _clean_observation(
         self, observation: ObjectObservation
     ) -> ObjectObservation | None:
@@ -337,12 +444,37 @@ class ObjectTracker:
         track_ids = sorted(self.tracks)
         scores = np.full((len(observations), len(track_ids)), -np.inf, dtype=np.float64)
         details: dict[tuple[int, int], tuple[float, float, float]] = {}
-        scored_rows = self._parallel_map(
-            lambda observation: self._score_observation(observation, track_ids),
-            observations,
-        )
-        for obs_index, candidates in enumerate(scored_rows):
-            for column, score, overlap, semantic, bbox in candidates:
+        for obs_index, observation in enumerate(observations):
+            observation_geometry = build_geometry_index(observation.points)
+            for column, track_id in enumerate(track_ids):
+                track = self.tracks[track_id]
+                track_geometry = track.geometry
+                if (
+                    np.linalg.norm(
+                        observation_geometry.centroid - track_geometry.centroid
+                    )
+                    > self.max_centroid_distance_m
+                ):
+                    continue
+                bbox = geometry_aabb_overlap(observation_geometry, track_geometry)
+                if bbox < self.min_bbox_overlap:
+                    continue
+                overlap = geometry_overlap(
+                    observation_geometry, track_geometry, self.overlap_radius
+                )
+                if overlap < self.min_geometric_overlap:
+                    continue
+                semantic = semantic_similarity(observation, track)
+                score = (
+                    self.geometry_weight * overlap
+                    + self.semantic_weight * semantic
+                )
+                if score < self.association_threshold:
+                    continue
+                if not self._extent_growth_is_valid(
+                    track_geometry, observation_geometry
+                ):
+                    continue
                 scores[obs_index, column] = score
                 details[(obs_index, column)] = (overlap, semantic, bbox)
 
@@ -385,41 +517,6 @@ class ObjectTracker:
             for row, column in pairs
         ]
 
-    def _score_observation(
-        self,
-        observation: ObjectObservation,
-        track_ids: list[int],
-    ) -> list[tuple[int, float, float, float, float]]:
-        """Score one observation against a read-only snapshot of active tracks."""
-        candidates = []
-        observation_centroid = observation.centroid
-        for column, track_id in enumerate(track_ids):
-            track = self.tracks[track_id]
-            if (
-                np.linalg.norm(observation_centroid - track.centroid)
-                > self.max_centroid_distance_m
-            ):
-                continue
-            bbox = aabb_overlap_ratio(observation.points, track.points)
-            if bbox < self.min_bbox_overlap:
-                continue
-            overlap = nearest_neighbor_overlap(
-                observation.points, track.points, self.overlap_radius
-            )
-            if overlap < self.min_geometric_overlap:
-                continue
-            semantic = semantic_similarity(observation, track)
-            score = (
-                self.geometry_weight * overlap
-                + self.semantic_weight * semantic
-            )
-            if score < self.association_threshold:
-                continue
-            if not self._extent_growth_is_valid(track.points, observation.points):
-                continue
-            candidates.append((column, score, overlap, semantic, bbox))
-        return candidates
-
     def _create_track(self, observation: ObjectObservation) -> TrackedObject:
         score = max(0.0, float(observation.confidence))
         track = TrackedObject(
@@ -457,18 +554,16 @@ class ObjectTracker:
         track.class_names[observation.class_id] = observation.class_name
         self._refresh_class(track)
         if observation.fuse_geometry:
-            points = np.concatenate((track.points, observation.points))
-            colors = (
-                np.concatenate((track.colors, observation.colors))
-                if track.colors is not None and observation.colors is not None
-                else None
+            track.points, track.colors = merge_voxel_clouds(
+                track.points,
+                track.colors,
+                observation.points,
+                observation.colors,
+                self.voxel_size,
             )
         else:
-            points = observation.points
-            colors = observation.colors
-        track.points, track.colors = voxel_downsample_with_colors(
-            points, colors, self.voxel_size
-        )
+            track.points = observation.points
+            track.colors = observation.colors
         self._update_status(track)
 
     def _merge_duplicate_tracks(self) -> dict[int, int]:
@@ -492,13 +587,17 @@ class ObjectTracker:
                 second = self.tracks[second_id]
                 if first.class_id != second.class_id:
                     continue
+                first_geometry = first.geometry
+                second_geometry = second.geometry
                 if (
-                    np.linalg.norm(first.centroid - second.centroid)
+                    np.linalg.norm(
+                        first_geometry.centroid - second_geometry.centroid
+                    )
                     > self.max_centroid_distance_m
                 ):
                     continue
-                overlap = nearest_neighbor_overlap(
-                    first.points, second.points, self.overlap_radius
+                overlap = geometry_overlap(
+                    first_geometry, second_geometry, self.overlap_radius
                 )
                 if overlap >= self.map_merge_overlap:
                     union(first_id, second_id)
@@ -531,30 +630,26 @@ class ObjectTracker:
                 target.semantic_scores.get(class_id, 0.0) + score
             )
         target.class_names.update(source.class_names)
-        points = np.concatenate((target.points, source.points))
-        colors = (
-            np.concatenate((target.colors, source.colors))
-            if target.colors is not None and source.colors is not None
-            else None
-        )
-        target.points, target.colors = voxel_downsample_with_colors(
-            points, colors, self.voxel_size
+        target.points, target.colors = merge_voxel_clouds(
+            target.points,
+            target.colors,
+            source.points,
+            source.colors,
+            self.voxel_size,
         )
         self._refresh_class(target)
         self._update_status(target)
 
     def _denoise_tracks(self) -> None:
-        self._parallel_map(self._denoise_track, list(self.tracks.values()))
-
-    def _denoise_track(self, track: TrackedObject) -> None:
-        keep = largest_spatial_cluster_indices(
-            track.points,
-            self.observation_cluster_eps,
-            self.observation_cluster_min_points,
-        )
-        track.points = track.points[keep]
-        if track.colors is not None:
-            track.colors = track.colors[keep]
+        for track in self.tracks.values():
+            keep = largest_spatial_cluster_indices(
+                track.points,
+                self.observation_cluster_eps,
+                self.observation_cluster_min_points,
+            )
+            track.points = track.points[keep]
+            if track.colors is not None:
+                track.colors = track.colors[keep]
 
     def _remove_stale(self, current_stamp: float) -> None:
         remove = []
@@ -574,10 +669,12 @@ class ObjectTracker:
             del self.tracks[track_id]
 
     def _extent_growth_is_valid(
-        self, existing: np.ndarray, observation: np.ndarray
+        self, existing: GeometryIndex, observation: GeometryIndex
     ) -> bool:
-        old_extent = np.maximum(np.ptp(existing, axis=0), self.voxel_size)
-        merged_extent = np.ptp(np.concatenate((existing, observation)), axis=0)
+        old_extent = np.maximum(existing.high - existing.low, self.voxel_size)
+        merged_low = np.minimum(existing.low, observation.low)
+        merged_high = np.maximum(existing.high, observation.high)
+        merged_extent = merged_high - merged_low
         return bool(
             np.all(
                 merged_extent

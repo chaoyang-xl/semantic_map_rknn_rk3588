@@ -51,10 +51,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-extent-growth", type=float, default=1.50)
     result.add_argument("--denoise-interval", type=int, default=20)
     result.add_argument("--map-merge-interval", type=int, default=0)
-    result.add_argument(
-        "--fusion-workers", type=int, default=1,
-        help="CPU worker threads for independent fusion jobs",
-    )
     result.add_argument("--min-confirmed-observations", type=int, default=8)
     result.add_argument("--candidate-max-missed-frames", type=int, default=30)
     result.add_argument("--progress-every", type=int, default=10)
