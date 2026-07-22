@@ -17,6 +17,62 @@ from .point_cloud_io import save_object_ply
 from .yolo_world_rknn import YoloWorldRknn, load_class_names
 
 
+_LOOP_TIMING_STAGES = (
+    "io",
+    "detection",
+    "sam_encoder",
+    "sam_decoder",
+    "projection",
+    "fusion",
+)
+_ALL_TIMING_STAGES = _LOOP_TIMING_STAGES + ("finalize", "save")
+
+
+def _record_stage(
+    totals: dict[str, float],
+    counts: dict[str, int],
+    name: str,
+    started: float,
+    *,
+    count: int = 1,
+) -> float:
+    """Accumulate one measured stage and return its elapsed seconds."""
+    elapsed = time.perf_counter() - started
+    totals[name] += elapsed
+    counts[name] += int(count)
+    return elapsed
+
+
+def _timing_report(
+    totals: dict[str, float],
+    counts: dict[str, int],
+    *,
+    elapsed: float,
+    frame_count: int,
+) -> dict:
+    """Build a compact, machine-readable profiling report."""
+    accounted = sum(totals.values())
+    stages = {}
+    for name in _ALL_TIMING_STAGES:
+        total = totals[name]
+        calls = counts[name]
+        stages[name] = {
+            "total_seconds": round(total, 6),
+            "share_percent": round(100.0 * total / elapsed, 2) if elapsed else 0.0,
+            "calls": calls,
+            "avg_ms_per_call": round(1000.0 * total / calls, 3) if calls else 0.0,
+            "avg_ms_per_frame": round(1000.0 * total / frame_count, 3)
+            if frame_count else 0.0,
+        }
+    return {
+        "scope": "dataset loop and final output; model initialization excluded",
+        "elapsed_seconds": round(elapsed, 6),
+        "accounted_seconds": round(accounted, 6),
+        "unaccounted_seconds": round(max(0.0, elapsed - accounted), 6),
+        "stages": stages,
+    }
+
+
 def _load_detections(path: Path, confidence: float) -> list[dict]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     output = []
@@ -164,28 +220,52 @@ def run_dataset(args) -> dict:
     )
     association_records = []
     input_detections = projected_detections = 0
+    stage_totals = {name: 0.0 for name in _ALL_TIMING_STAGES}
+    stage_counts = {name: 0 for name in _ALL_TIMING_STAGES}
     started = time.perf_counter()
     try:
         for processed, frame_id in enumerate(frame_ids, start=1):
             frame_started = time.perf_counter()
+            frame_stages = {name: 0.0 for name in _LOOP_TIMING_STAGES}
+            stage_started = time.perf_counter()
             image = cv2.imread(str(data_root / "results" / f"frame{frame_id:06d}.jpg"))
             depth = cv2.imread(
                 str(data_root / "results" / f"depth{frame_id:06d}.png"),
                 cv2.IMREAD_UNCHANGED,
             )
+            frame_stages["io"] = _record_stage(
+                stage_totals, stage_counts, "io", stage_started
+            )
             if image is None or depth is None:
                 raise FileNotFoundError(f"Unable to load frame {frame_id}")
+            stage_started = time.perf_counter()
             if use_exported:
                 detections = _load_detections(detection_paths[processed - 1], args.confidence)
             else:
                 detections = [item.as_dict() for item in detector.predict(image)]
                 detections = [d for d in detections if d["class_name"].casefold() != "person"]
+            frame_stages["detection"] = _record_stage(
+                stage_totals, stage_counts, "detection", stage_started
+            )
             input_detections += len(detections)
             observations, frame_records = [], []
             if detections:
+                stage_started = time.perf_counter()
                 segmenter.set_image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+                frame_stages["sam_encoder"] = _record_stage(
+                    stage_totals, stage_counts, "sam_encoder", stage_started
+                )
                 boxes = np.asarray([item["xyxy"] for item in detections], dtype=np.float32)
+                stage_started = time.perf_counter()
                 mask_results = segmenter.predict_boxes(boxes)
+                frame_stages["sam_decoder"] = _record_stage(
+                    stage_totals,
+                    stage_counts,
+                    "sam_decoder",
+                    stage_started,
+                    count=len(boxes),
+                )
+                stage_started = time.perf_counter()
                 depth_m = depth.astype(np.float32) / float(camera.get("scale", 1000.0))
                 for detection_id, (detection, sam_result) in enumerate(zip(detections, mask_results)):
                     mask = sam_result.mask
@@ -233,6 +313,14 @@ def run_dataset(args) -> dict:
                         "mask_area_pixels": int(np.count_nonzero(mask)),
                         "forward_point_count": int(points_map.shape[0]),
                     })
+                frame_stages["projection"] = _record_stage(
+                    stage_totals,
+                    stage_counts,
+                    "projection",
+                    stage_started,
+                    count=len(mask_results),
+                )
+            stage_started = time.perf_counter()
             assignments = tracker.update(observations)
             for assignment in assignments:
                 record = frame_records[assignment.observation_index]
@@ -243,6 +331,9 @@ def run_dataset(args) -> dict:
                     "semantic_similarity": assignment.semantic_similarity,
                     "is_new_track": assignment.is_new,
                 })
+            frame_stages["fusion"] = _record_stage(
+                stage_totals, stage_counts, "fusion", stage_started
+            )
             projected_detections += len(frame_records)
             association_records.extend(frame_records)
             if processed == 1 or processed == len(frame_ids) or (
@@ -250,11 +341,16 @@ def run_dataset(args) -> dict:
             ):
                 elapsed = time.perf_counter() - started
                 eta = elapsed / processed * (len(frame_ids) - processed)
+                stage_text = " ".join(
+                    f"{name}={frame_stages[name] * 1000.0:.1f}"
+                    for name in _LOOP_TIMING_STAGES
+                )
                 print(
                     f"[{processed}/{len(frame_ids)}] frame={frame_id} "
                     f"det={len(detections)} projected={len(frame_records)} "
                     f"tracks={len(tracker.tracks)} ETA={time.strftime('%H:%M:%S', time.gmtime(eta))} "
-                    f"frame_s={time.perf_counter() - frame_started:.3f}",
+                    f"frame_s={time.perf_counter() - frame_started:.3f} "
+                    f"stage_ms[{stage_text}]",
                     flush=True,
                 )
     finally:
@@ -262,7 +358,11 @@ def run_dataset(args) -> dict:
         if detector is not None:
             detector.close()
 
+    stage_started = time.perf_counter()
     tracker.finalize()
+    _record_stage(stage_totals, stage_counts, "finalize", stage_started)
+
+    stage_started = time.perf_counter()
     object_records = save_tracks(output, tracker)
     write_semantic_object_map(
         output / "semantic_objects.json",
@@ -279,6 +379,14 @@ def run_dataset(args) -> dict:
     (output / "associations.json").write_text(
         json.dumps(association_records, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    _record_stage(stage_totals, stage_counts, "save", stage_started)
+    elapsed = time.perf_counter() - started
+    timing = _timing_report(
+        stage_totals,
+        stage_counts,
+        elapsed=elapsed,
+        frame_count=len(frame_ids),
+    )
     summary = {
         "frame_start": args.start,
         "frame_count": len(frame_ids),
@@ -290,8 +398,10 @@ def run_dataset(args) -> dict:
         "objects": len(object_records),
         "projection_mode": "rknn_mobilesam",
         "depth_range_m": [args.min_depth, args.max_depth],
-        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "elapsed_seconds": round(elapsed, 3),
+        "timing": timing,
     }
+    (output / "timing.json").write_text(json.dumps(timing, indent=2), encoding="utf-8")
     (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
     return summary

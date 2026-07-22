@@ -185,6 +185,20 @@ python3 scripts/evaluate_rknn_projection_tracking.py \
 each selected frame's original pose and file index. `--frames` still limits the number
 of processed frames; use `--frame-step 1` for the full sequence.
 
+Progress lines include per-frame milliseconds for `io`, `detection`,
+`sam_encoder`, `sam_decoder`, `projection`, and `fusion`. After a
+successful run, the output directory also contains `timing.json`. It reports
+total time, percentage, call count, average time per call, and average time per
+frame for every stage:
+
+```bash
+cat /data/semantic_05/tracking_rknn/timing.json
+```
+
+Model loading happens before the measured interval and is intentionally excluded.
+Final object cleanup and file serialization are reported as `finalize` and
+`save`.
+
 If detection JSON is absent, additionally provide:
 
 ```text
