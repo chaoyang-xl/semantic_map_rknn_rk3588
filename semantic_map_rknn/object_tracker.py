@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -179,6 +180,7 @@ class ObjectTracker:
         min_confirmed_observations: int = 3,
         candidate_max_missed_frames: int = 30,
         stale_after_s: float = 0.0,
+        worker_count: int = 1,
     ) -> None:
         if voxel_size <= 0.0 or overlap_radius <= 0.0:
             raise ValueError("voxel_size and overlap_radius must be positive")
@@ -204,9 +206,24 @@ class ObjectTracker:
         self.min_confirmed_observations = max(1, int(min_confirmed_observations))
         self.candidate_max_missed_frames = max(0, int(candidate_max_missed_frames))
         self.stale_after_s = max(0.0, float(stale_after_s))
+        self.worker_count = max(1, int(worker_count))
+        self._executor = (
+            ThreadPoolExecutor(
+                max_workers=self.worker_count,
+                thread_name_prefix="semantic-fusion",
+            )
+            if self.worker_count > 1
+            else None
+        )
         self.tracks: dict[int, TrackedObject] = {}
         self._next_track_id = 1
         self._frame_count = 0
+
+    def _parallel_map(self, function, items: list):
+        """Run independent CPU jobs in stable input order."""
+        if self._executor is None or len(items) < 2:
+            return [function(item) for item in items]
+        return list(self._executor.map(function, items))
 
     @property
     def confirmed_tracks(self) -> dict[int, TrackedObject]:
@@ -225,17 +242,25 @@ class ObjectTracker:
 
         cleaned = []
         source_indices = []
-        for source_index, observation in enumerate(observations):
-            item = self._clean_observation(observation)
+        cleaned_items = self._parallel_map(self._clean_observation, observations)
+        for source_index, item in enumerate(cleaned_items):
             if item is not None:
                 cleaned.append(item)
                 source_indices.append(source_index)
         assignments = self._assign(cleaned)
         matched_observations = {item.observation_index for item in assignments}
 
-        for association in assignments:
-            track = self.tracks[association.track_id]
-            self._merge_observation(track, cleaned[association.observation_index])
+        merge_jobs = [
+            (
+                self.tracks[association.track_id],
+                cleaned[association.observation_index],
+            )
+            for association in assignments
+        ]
+        self._parallel_map(
+            lambda job: self._merge_observation(job[0], job[1]),
+            merge_jobs,
+        )
 
         results = list(assignments)
         for index, observation in enumerate(cleaned):
@@ -274,6 +299,19 @@ class ObjectTracker:
         self._merge_duplicate_tracks()
         self.tracks = dict(self.confirmed_tracks)
 
+    def close(self) -> None:
+        """Wait for fusion workers and release their threads."""
+        executor = self._executor
+        self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort process cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _clean_observation(
         self, observation: ObjectObservation
     ) -> ObjectObservation | None:
@@ -299,31 +337,12 @@ class ObjectTracker:
         track_ids = sorted(self.tracks)
         scores = np.full((len(observations), len(track_ids)), -np.inf, dtype=np.float64)
         details: dict[tuple[int, int], tuple[float, float, float]] = {}
-        for obs_index, observation in enumerate(observations):
-            for column, track_id in enumerate(track_ids):
-                track = self.tracks[track_id]
-                if (
-                    np.linalg.norm(observation.centroid - track.centroid)
-                    > self.max_centroid_distance_m
-                ):
-                    continue
-                bbox = aabb_overlap_ratio(observation.points, track.points)
-                if bbox < self.min_bbox_overlap:
-                    continue
-                overlap = nearest_neighbor_overlap(
-                    observation.points, track.points, self.overlap_radius
-                )
-                if overlap < self.min_geometric_overlap:
-                    continue
-                semantic = semantic_similarity(observation, track)
-                score = (
-                    self.geometry_weight * overlap
-                    + self.semantic_weight * semantic
-                )
-                if score < self.association_threshold:
-                    continue
-                if not self._extent_growth_is_valid(track.points, observation.points):
-                    continue
+        scored_rows = self._parallel_map(
+            lambda observation: self._score_observation(observation, track_ids),
+            observations,
+        )
+        for obs_index, candidates in enumerate(scored_rows):
+            for column, score, overlap, semantic, bbox in candidates:
                 scores[obs_index, column] = score
                 details[(obs_index, column)] = (overlap, semantic, bbox)
 
@@ -365,6 +384,41 @@ class ObjectTracker:
             )
             for row, column in pairs
         ]
+
+    def _score_observation(
+        self,
+        observation: ObjectObservation,
+        track_ids: list[int],
+    ) -> list[tuple[int, float, float, float, float]]:
+        """Score one observation against a read-only snapshot of active tracks."""
+        candidates = []
+        observation_centroid = observation.centroid
+        for column, track_id in enumerate(track_ids):
+            track = self.tracks[track_id]
+            if (
+                np.linalg.norm(observation_centroid - track.centroid)
+                > self.max_centroid_distance_m
+            ):
+                continue
+            bbox = aabb_overlap_ratio(observation.points, track.points)
+            if bbox < self.min_bbox_overlap:
+                continue
+            overlap = nearest_neighbor_overlap(
+                observation.points, track.points, self.overlap_radius
+            )
+            if overlap < self.min_geometric_overlap:
+                continue
+            semantic = semantic_similarity(observation, track)
+            score = (
+                self.geometry_weight * overlap
+                + self.semantic_weight * semantic
+            )
+            if score < self.association_threshold:
+                continue
+            if not self._extent_growth_is_valid(track.points, observation.points):
+                continue
+            candidates.append((column, score, overlap, semantic, bbox))
+        return candidates
 
     def _create_track(self, observation: ObjectObservation) -> TrackedObject:
         score = max(0.0, float(observation.confidence))
@@ -490,15 +544,17 @@ class ObjectTracker:
         self._update_status(target)
 
     def _denoise_tracks(self) -> None:
-        for track in self.tracks.values():
-            keep = largest_spatial_cluster_indices(
-                track.points,
-                self.observation_cluster_eps,
-                self.observation_cluster_min_points,
-            )
-            track.points = track.points[keep]
-            if track.colors is not None:
-                track.colors = track.colors[keep]
+        self._parallel_map(self._denoise_track, list(self.tracks.values()))
+
+    def _denoise_track(self, track: TrackedObject) -> None:
+        keep = largest_spatial_cluster_indices(
+            track.points,
+            self.observation_cluster_eps,
+            self.observation_cluster_min_points,
+        )
+        track.points = track.points[keep]
+        if track.colors is not None:
+            track.colors = track.colors[keep]
 
     def _remove_stale(self, current_stamp: float) -> None:
         remove = []

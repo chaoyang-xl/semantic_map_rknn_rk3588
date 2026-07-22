@@ -177,6 +177,7 @@ python3 scripts/evaluate_rknn_projection_tracking.py \
   --min-depth 0.3 \
   --max-depth 5.0 \
   --pixel-stride 2 \
+  --fusion-workers 4 \
   --min-confirmed-observations 8 \
   --progress-every 10
 ```
@@ -197,7 +198,9 @@ cat /data/semantic_05/tracking_rknn/timing.json
 
 Model loading happens before the measured interval and is intentionally excluded.
 Final object cleanup and file serialization are reported as `finalize` and
-`save`.
+`save`. Set `--fusion-workers 4` on RK3588 to parallelize independent
+observation cleaning, candidate scoring, track updates, and denoising. The
+default is `1` for backwards-compatible deterministic scheduling.
 
 If detection JSON is absent, additionally provide:
 

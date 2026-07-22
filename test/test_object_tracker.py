@@ -132,6 +132,46 @@ def test_periodic_map_merge_removes_duplicate_tracks():
     assert len(mapping.tracks) == 1
 
 
+def test_parallel_tracker_matches_serial_results():
+    serial = tracker(worker_count=1, denoise_interval=1)
+    parallel = tracker(worker_count=4, denoise_interval=1)
+    frames = [
+        [
+            observation(0, [0, 0, 1], stamp=1.0),
+            observation(1, [1, 0, 1], stamp=1.0),
+        ],
+        [
+            observation(0, [0.01, 0, 1], stamp=2.0),
+            observation(1, [1.01, 0, 1], stamp=2.0),
+        ],
+        [
+            observation(0, [0.02, 0, 1], stamp=3.0),
+            observation(1, [1.02, 0, 1], stamp=3.0),
+        ],
+    ]
+    try:
+        for items in frames:
+            serial_matches = serial.update(items)
+            parallel_matches = parallel.update(items)
+            assert [
+                (item.observation_index, item.track_id, item.is_new)
+                for item in parallel_matches
+            ] == [
+                (item.observation_index, item.track_id, item.is_new)
+                for item in serial_matches
+            ]
+        assert parallel.worker_count == 4
+        assert sorted(parallel.tracks) == sorted(serial.tracks)
+        for track_id in serial.tracks:
+            serial_track = serial.tracks[track_id]
+            parallel_track = parallel.tracks[track_id]
+            assert parallel_track.observation_count == serial_track.observation_count
+            np.testing.assert_allclose(parallel_track.points, serial_track.points)
+    finally:
+        serial.close()
+        parallel.close()
+
+
 def test_voxel_downsample_preserves_rgb_alignment():
     points = np.asarray([[0.01, 0, 0], [0.02, 0, 0]], dtype=np.float32)
     colors = np.asarray([[100, 20, 0], [200, 40, 10]], dtype=np.uint8)

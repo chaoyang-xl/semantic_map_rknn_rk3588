@@ -40,6 +40,7 @@ def generate_launch_description() -> LaunchDescription:
         "frame_skip": "0",
         "output_directory": "/home/orangepi/semantic_map_output",
         "snapshot_path": "/home/orangepi/semantic_map_output/semantic_objects.json",
+        "fusion_workers": "1",
         "publish_debug_image": "true",
         "publish_markers": "true",
     }
@@ -111,6 +112,7 @@ def generate_launch_description() -> LaunchDescription:
                 "output_directory": LaunchConfiguration("output_directory"),
                 "snapshot_path": LaunchConfiguration("snapshot_path"),
                 "publish_markers": LaunchConfiguration("publish_markers"),
+                "fusion_workers": LaunchConfiguration("fusion_workers"),
             },
         ],
     )

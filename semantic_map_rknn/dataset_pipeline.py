@@ -216,6 +216,7 @@ def run_dataset(args) -> dict:
         denoise_interval=args.denoise_interval,
         map_merge_interval=args.map_merge_interval,
         min_confirmed_observations=args.min_confirmed_observations,
+        worker_count=int(getattr(args, "fusion_workers", 1)),
         candidate_max_missed_frames=args.candidate_max_missed_frames,
     )
     association_records = []
@@ -392,6 +393,7 @@ def run_dataset(args) -> dict:
         "frame_count": len(frame_ids),
         "frame_step": frame_step,
         "frame_last": frame_ids[-1],
+        "fusion_workers": tracker.worker_count,
         "detection_source": "exported_json" if use_exported else "rknn_yolo_world",
         "input_detections": input_detections,
         "projected_detections": projected_detections,
@@ -403,5 +405,6 @@ def run_dataset(args) -> dict:
     }
     (output / "timing.json").write_text(json.dumps(timing, indent=2), encoding="utf-8")
     (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    tracker.close()
     print(json.dumps(summary, indent=2), flush=True)
     return summary
