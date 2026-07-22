@@ -263,6 +263,7 @@ def run_dataset(args) -> dict:
         observation_cluster_eps=args.observation_cluster_eps,
         observation_cluster_min_points=args.observation_cluster_min_points,
         max_extent_growth=args.max_extent_growth,
+        association_max_points=args.association_max_points,
         denoise_interval=args.denoise_interval,
         map_merge_interval=args.map_merge_interval,
         min_confirmed_observations=args.min_confirmed_observations,
@@ -448,6 +449,12 @@ def run_dataset(args) -> dict:
                 "sam_encoder": args.sam_encoder_core,
                 "sam_decoder": args.sam_decoder_core,
             },
+            "point_cloud_policy": {
+                "voxel_size": args.voxel_size,
+                "association_max_points": args.association_max_points,
+                "denoise_interval": args.denoise_interval,
+                "final_denoise": True,
+            },
         },
     )
     (output / "associations.json").write_text(
@@ -471,6 +478,12 @@ def run_dataset(args) -> dict:
             "yolo": args.yolo_core,
             "sam_encoder": args.sam_encoder_core,
             "sam_decoder": args.sam_decoder_core,
+        },
+        "point_cloud_policy": {
+            "voxel_size": args.voxel_size,
+            "association_max_points": args.association_max_points,
+            "denoise_interval": args.denoise_interval,
+            "final_denoise": True,
         },
         "detection_source": "exported_json" if use_exported else "rknn_yolo_world",
         "input_detections": input_detections,

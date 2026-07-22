@@ -45,10 +45,12 @@ semantic_rknn_fusion:
     association_threshold: 0.50
     geometry_weight: 0.70
     semantic_weight: 0.30
-    observation_cluster_eps: 0.10
+    # Projector already clusters each observation; avoid doing the same DBSCAN twice.
+    observation_cluster_eps: 0.0
     observation_cluster_min_points: 10
     max_extent_growth: 1.50
-    denoise_interval: 20
+    association_max_points: 4096
+    denoise_interval: 0
     map_merge_interval: 0
     min_confirmed_observations: 8
     candidate_max_missed_frames: 30

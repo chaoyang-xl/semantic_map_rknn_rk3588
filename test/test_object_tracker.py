@@ -224,3 +224,27 @@ def test_geometry_overlap_skips_reverse_query_after_full_overlap():
     assert geometry_overlap(first, second, 0.04) == 1.0
     assert forward_tree.calls == 1
     assert reverse_tree.calls == 0
+
+
+def test_geometry_index_caps_search_cloud_without_truncating_source():
+    points = np.column_stack((
+        np.linspace(-2.0, 2.0, 10000, dtype=np.float32),
+        np.zeros(10000, dtype=np.float32),
+        np.ones(10000, dtype=np.float32),
+    ))
+
+    geometry = build_geometry_index(points, max_search_points=512)
+
+    assert geometry.points.shape == (10000, 3)
+    assert geometry.search_points.shape == (512, 3)
+    np.testing.assert_allclose(geometry.low, [-2.0, 0.0, 1.0])
+    np.testing.assert_allclose(geometry.high, [2.0, 0.0, 1.0])
+
+
+def test_tracker_keeps_full_cloud_while_capping_association_geometry():
+    mapping = tracker(association_max_points=4)
+    track_id = mapping.update([observation(0, [0, 0, 1])])[0].track_id
+    track = mapping.tracks[track_id]
+
+    assert track.points.shape[0] == 9
+    assert track.geometry.search_points.shape[0] == 4

@@ -18,23 +18,35 @@ class GeometryIndex:
     low: np.ndarray
     high: np.ndarray
     tree: object | None
+    search_points: np.ndarray | None = None
 
 
-def build_geometry_index(points: np.ndarray) -> GeometryIndex:
+def build_geometry_index(
+    points: np.ndarray, max_search_points: int = 0
+) -> GeometryIndex:
     """Build geometric summaries once for repeated association checks."""
     point_array = np.asarray(points, dtype=np.float32)
+    limit = max(0, int(max_search_points))
+    if limit and point_array.shape[0] > limit:
+        indices = np.linspace(
+            0, point_array.shape[0] - 1, limit, dtype=np.int64
+        )
+        search_points = point_array[indices]
+    else:
+        search_points = point_array
     try:
         from scipy.spatial import cKDTree
     except ImportError:
         tree = None
     else:
-        tree = cKDTree(point_array)
+        tree = cKDTree(search_points)
     return GeometryIndex(
         points=point_array,
         centroid=np.mean(point_array, axis=0),
         low=np.min(point_array, axis=0),
         high=np.max(point_array, axis=0),
         tree=tree,
+        search_points=search_points,
     )
 
 
@@ -73,6 +85,7 @@ class TrackedObject:
     class_names: dict[int, str] = field(default_factory=dict)
     missed_frames: int = 0
     status: str = "candidate"
+    association_max_points: int = 4096
     _geometry: GeometryIndex | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -80,7 +93,9 @@ class TrackedObject:
     @property
     def geometry(self) -> GeometryIndex:
         if self._geometry is None or self._geometry.points is not self.points:
-            self._geometry = build_geometry_index(self.points)
+            self._geometry = build_geometry_index(
+                self.points, self.association_max_points
+            )
         return self._geometry
 
     @property
@@ -224,29 +239,35 @@ def merge_voxel_clouds(
 def geometry_overlap(
     first: GeometryIndex, second: GeometryIndex, radius: float
 ) -> float:
-    """Return bidirectional nearest-neighbour overlap using reusable indices."""
-    if first.points.size == 0 or second.points.size == 0 or radius <= 0.0:
+    """Return bidirectional overlap using bounded association clouds."""
+    first_search = (
+        first.points if first.search_points is None else first.search_points
+    )
+    second_search = (
+        second.points if second.search_points is None else second.search_points
+    )
+    if first_search.size == 0 or second_search.size == 0 or radius <= 0.0:
         return 0.0
     if first.tree is None or second.tree is None:
         keys_a = {
             tuple(key)
-            for key in np.floor(first.points / radius).astype(np.int64)
+            for key in np.floor(first_search / radius).astype(np.int64)
         }
         keys_b = {
             tuple(key)
-            for key in np.floor(second.points / radius).astype(np.int64)
+            for key in np.floor(second_search / radius).astype(np.int64)
         }
         intersection = len(keys_a & keys_b)
         return max(intersection / len(keys_a), intersection / len(keys_b))
 
     distance_a, _ = second.tree.query(
-        first.points, k=1, distance_upper_bound=radius
+        first_search, k=1, distance_upper_bound=radius
     )
     overlap_a = float(np.mean(distance_a <= radius))
     if overlap_a == 1.0:
         return 1.0
     distance_b, _ = first.tree.query(
-        second.points, k=1, distance_upper_bound=radius
+        second_search, k=1, distance_upper_bound=radius
     )
     return max(overlap_a, float(np.mean(distance_b <= radius)))
 
@@ -331,7 +352,8 @@ class ObjectTracker:
         observation_cluster_eps: float = 0.10,
         observation_cluster_min_points: int = 10,
         max_extent_growth: float = 2.0,
-        denoise_interval: int = 20,
+        association_max_points: int = 4096,
+        denoise_interval: int = 0,
         map_merge_interval: int = 20,
         map_merge_overlap: float = 0.80,
         min_confirmed_observations: int = 3,
@@ -356,6 +378,7 @@ class ObjectTracker:
             1, int(observation_cluster_min_points)
         )
         self.max_extent_growth = max(1.0, float(max_extent_growth))
+        self.association_max_points = max(0, int(association_max_points))
         self.denoise_interval = max(0, int(denoise_interval))
         self.map_merge_interval = max(0, int(map_merge_interval))
         self.map_merge_overlap = float(map_merge_overlap)
@@ -458,7 +481,9 @@ class ObjectTracker:
         scores = np.full((len(observations), len(track_ids)), -np.inf, dtype=np.float64)
         details: dict[tuple[int, int], tuple[float, float, float]] = {}
         for obs_index, observation in enumerate(observations):
-            observation_geometry = build_geometry_index(observation.points)
+            observation_geometry = build_geometry_index(
+                observation.points, self.association_max_points
+            )
             for column, track_id in enumerate(track_ids):
                 track = self.tracks[track_id]
                 track_geometry = track.geometry
@@ -548,6 +573,7 @@ class ObjectTracker:
             colors=None if observation.colors is None else observation.colors.copy(),
             semantic_scores={observation.class_id: score},
             class_names={observation.class_id: observation.class_name},
+            association_max_points=self.association_max_points,
         )
         self._update_status(track)
         self.tracks[track.track_id] = track

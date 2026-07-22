@@ -53,7 +53,8 @@ class ObjectFusionNode(Node):
             "observation_cluster_eps": 0.10,
             "observation_cluster_min_points": 10,
             "max_extent_growth": 2.0,
-            "denoise_interval": 20,
+            "association_max_points": 4096,
+            "denoise_interval": 0,
             "map_merge_interval": 20,
             "map_merge_overlap": 0.80,
             "min_confirmed_observations": 3,
@@ -70,7 +71,7 @@ class ObjectFusionNode(Node):
             "min_geometric_overlap", "min_bbox_overlap",
             "association_threshold", "geometry_weight", "semantic_weight",
             "observation_cluster_eps", "observation_cluster_min_points",
-            "max_extent_growth", "denoise_interval", "map_merge_interval",
+            "max_extent_growth", "association_max_points", "denoise_interval", "map_merge_interval",
             "map_merge_overlap", "min_confirmed_observations",
             "candidate_max_missed_frames", "stale_after_s",
         )
@@ -115,7 +116,10 @@ class ObjectFusionNode(Node):
                 MarkerArray, str(self.get_parameter("marker_topic").value), 10
             )
         self.get_logger().info(
-            "Object tracker ready: nearest-neighbour geometry + semantic history, "
+            "Object tracker ready: bounded nearest-neighbour geometry + "
+            "semantic history, "
+            f"association_max_points={self._fusion.association_max_points}, "
+            f"denoise_interval={self._fusion.denoise_interval}, "
             f"non_fusing={sorted(self._non_fusing_labels)}"
         )
 

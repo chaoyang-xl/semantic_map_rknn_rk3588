@@ -177,6 +177,8 @@ python3 scripts/evaluate_rknn_projection_tracking.py \
   --min-depth 0.3 \
   --max-depth 5.0 \
   --pixel-stride 2 \
+  --association-max-points 4096 \
+  --denoise-interval 0 \
   --min-confirmed-observations 8 \
   --progress-every 10
 ```
@@ -282,8 +284,11 @@ but it does not replace the RK3588-specific NPU section in this script.
 
 MobileSAM runs the encoder once per processed image and the decoder once per
 detection. Start with `frame_skip:=2` if both YOLO and SAM share the NPU. Keep
-`pixel_stride=2` and `voxel_size=0.02` for initial board tests. Increasing
-`denoise_interval` reduces CPU spikes from growing object point clouds.
+`pixel_stride=2` and `voxel_size=0.02` for initial board tests. The RK3588 defaults keep the full `voxel_size=0.02` RGB cloud for output, but
+cap association geometry at 4096 representative points. Runtime-wide track
+DBSCAN is disabled with `denoise_interval=0`; a final denoise still runs before
+objects are saved. The ROS projector already clusters each observation, so the
+fusion node does not repeat that operation.
 
 The ROS projector intentionally drops frames when inference is slower than the
 camera. It preserves timestamp correctness instead of building an unbounded
