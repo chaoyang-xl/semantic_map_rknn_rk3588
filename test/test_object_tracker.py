@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from semantic_map_rknn.spatial_filter import largest_spatial_cluster_indices
 from semantic_map_rknn.object_tracker import (
     ObjectObservation,
     ObjectTracker,
@@ -248,3 +249,32 @@ def test_tracker_keeps_full_cloud_while_capping_association_geometry():
 
     assert track.points.shape[0] == 9
     assert track.geometry.search_points.shape[0] == 4
+
+def test_spatial_filter_keeps_largest_cluster_and_removes_background():
+    first = np.column_stack((
+        np.linspace(0.0, 0.18, 20, dtype=np.float32),
+        np.zeros(20, dtype=np.float32),
+        np.ones(20, dtype=np.float32),
+    ))
+    second = np.column_stack((
+        np.linspace(2.0, 2.08, 6, dtype=np.float32),
+        np.zeros(6, dtype=np.float32),
+        np.ones(6, dtype=np.float32),
+    ))
+    noise = np.asarray([[5.0, 5.0, 5.0]], dtype=np.float32)
+    points = np.concatenate((first, second, noise))
+
+    keep = largest_spatial_cluster_indices(points, eps=0.03, min_points=3)
+
+    np.testing.assert_array_equal(keep, np.arange(20))
+
+
+def test_spatial_filter_falls_back_when_no_core_cluster_exists():
+    points = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+
+    keep = largest_spatial_cluster_indices(points, eps=0.1, min_points=3)
+
+    np.testing.assert_array_equal(keep, np.arange(3))

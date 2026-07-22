@@ -290,6 +290,10 @@ DBSCAN is disabled with `denoise_interval=0`; a final denoise still runs before
 objects are saved. The ROS projector already clusters each observation, so the
 fusion node does not repeat that operation.
 
+Offline observation cleanup uses a bounded 32-neighbour connectivity graph
+instead of materializing every radius neighbour. This preserves the full
+output cloud while keeping dense-frame clustering cost bounded on RK3588.
+
 The ROS projector intentionally drops frames when inference is slower than the
 camera. It preserves timestamp correctness instead of building an unbounded
 queue. Offline dataset processing does not drop frames.
