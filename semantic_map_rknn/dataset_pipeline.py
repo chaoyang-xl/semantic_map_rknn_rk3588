@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import time
@@ -26,6 +27,20 @@ _LOOP_TIMING_STAGES = (
     "fusion",
 )
 _ALL_TIMING_STAGES = _LOOP_TIMING_STAGES + ("finalize", "save")
+
+
+def _accumulate_stage(
+    totals: dict[str, float],
+    counts: dict[str, int],
+    name: str,
+    elapsed: float,
+    *,
+    count: int = 1,
+) -> float:
+    """Accumulate work measured inside an optional pipeline stage."""
+    totals[name] += elapsed
+    counts[name] += int(count)
+    return elapsed
 
 
 def _record_stage(
@@ -69,6 +84,7 @@ def _timing_report(
         "elapsed_seconds": round(elapsed, 6),
         "accounted_seconds": round(accounted, 6),
         "unaccounted_seconds": round(max(0.0, elapsed - accounted), 6),
+        "overlapped_seconds": round(max(0.0, accounted - elapsed), 6),
         "stages": stages,
     }
 
@@ -96,6 +112,40 @@ def _transform(points: np.ndarray, camera_to_map: np.ndarray) -> np.ndarray:
         points.astype(np.float64) @ camera_to_map[:3, :3].T
         + camera_to_map[:3, 3]
     ).astype(np.float32)
+
+
+def _prepare_frame(
+    data_root: Path,
+    frame_id: int,
+    detection_path: Path,
+    *,
+    use_exported: bool,
+    detector,
+    confidence: float,
+) -> tuple[np.ndarray, np.ndarray, list[dict], float, float]:
+    """Load RGB-D and run YOLO, suitable for one-frame NPU prefetch."""
+    started = time.perf_counter()
+    image = cv2.imread(str(data_root / "results" / f"frame{frame_id:06d}.jpg"))
+    depth = cv2.imread(
+        str(data_root / "results" / f"depth{frame_id:06d}.png"),
+        cv2.IMREAD_UNCHANGED,
+    )
+    io_elapsed = time.perf_counter() - started
+    if image is None or depth is None:
+        raise FileNotFoundError(f"Unable to load frame {frame_id}")
+
+    started = time.perf_counter()
+    if use_exported:
+        detections = _load_detections(detection_path, confidence)
+    else:
+        detections = [item.as_dict() for item in detector.predict(image)]
+        detections = [
+            item
+            for item in detections
+            if item["class_name"].casefold() != "person"
+        ]
+    detection_elapsed = time.perf_counter() - started
+    return image, depth, detections, io_elapsed, detection_elapsed
 
 
 def save_tracks(
@@ -222,30 +272,46 @@ def run_dataset(args) -> dict:
     input_detections = projected_detections = 0
     stage_totals = {name: 0.0 for name in _ALL_TIMING_STAGES}
     stage_counts = {name: 0 for name in _ALL_TIMING_STAGES}
+    pipeline_prefetch = bool(getattr(args, "pipeline_prefetch", False))
+    executor = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="rknn-yolo-prefetch")
+        if pipeline_prefetch
+        else None
+    )
+
+    def submit_frame(position: int):
+        frame_id = frame_ids[position]
+        arguments = (data_root, frame_id, detection_paths[position])
+        keywords = {
+            "use_exported": use_exported,
+            "detector": detector,
+            "confidence": args.confidence,
+        }
+        if executor is None:
+            return _prepare_frame(*arguments, **keywords)
+        return executor.submit(_prepare_frame, *arguments, **keywords)
+
     started = time.perf_counter()
+    pending = submit_frame(0) if executor is not None else None
     try:
         for processed, frame_id in enumerate(frame_ids, start=1):
             frame_started = time.perf_counter()
             frame_stages = {name: 0.0 for name in _LOOP_TIMING_STAGES}
-            stage_started = time.perf_counter()
-            image = cv2.imread(str(data_root / "results" / f"frame{frame_id:06d}.jpg"))
-            depth = cv2.imread(
-                str(data_root / "results" / f"depth{frame_id:06d}.png"),
-                cv2.IMREAD_UNCHANGED,
-            )
-            frame_stages["io"] = _record_stage(
-                stage_totals, stage_counts, "io", stage_started
-            )
-            if image is None or depth is None:
-                raise FileNotFoundError(f"Unable to load frame {frame_id}")
-            stage_started = time.perf_counter()
-            if use_exported:
-                detections = _load_detections(detection_paths[processed - 1], args.confidence)
+            if pending is None:
+                prepared = submit_frame(processed - 1)
             else:
-                detections = [item.as_dict() for item in detector.predict(image)]
-                detections = [d for d in detections if d["class_name"].casefold() != "person"]
-            frame_stages["detection"] = _record_stage(
-                stage_totals, stage_counts, "detection", stage_started
+                prepared = pending.result()
+                pending = (
+                    submit_frame(processed)
+                    if processed < len(frame_ids)
+                    else None
+                )
+            image, depth, detections, io_elapsed, detection_elapsed = prepared
+            frame_stages["io"] = _accumulate_stage(
+                stage_totals, stage_counts, "io", io_elapsed
+            )
+            frame_stages["detection"] = _accumulate_stage(
+                stage_totals, stage_counts, "detection", detection_elapsed
             )
             input_detections += len(detections)
             observations, frame_records = [], []
@@ -354,6 +420,8 @@ def run_dataset(args) -> dict:
                     flush=True,
                 )
     finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
         segmenter.close()
         if detector is not None:
             detector.close()
@@ -374,6 +442,12 @@ def run_dataset(args) -> dict:
             "frame_count": len(frame_ids),
             "frame_step": frame_step,
             "frame_last": frame_ids[-1],
+            "pipeline_prefetch": pipeline_prefetch,
+            "npu_core_masks": {
+                "yolo": args.yolo_core,
+                "sam_encoder": args.sam_encoder_core,
+                "sam_decoder": args.sam_decoder_core,
+            },
         },
     )
     (output / "associations.json").write_text(
@@ -392,6 +466,12 @@ def run_dataset(args) -> dict:
         "frame_count": len(frame_ids),
         "frame_step": frame_step,
         "frame_last": frame_ids[-1],
+        "pipeline_prefetch": pipeline_prefetch,
+        "npu_core_masks": {
+            "yolo": args.yolo_core,
+            "sam_encoder": args.sam_encoder_core,
+            "sam_decoder": args.sam_decoder_core,
+        },
         "detection_source": "exported_json" if use_exported else "rknn_yolo_world",
         "input_detections": input_detections,
         "projected_detections": projected_detections,

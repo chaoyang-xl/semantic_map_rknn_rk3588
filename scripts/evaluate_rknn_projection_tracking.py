@@ -29,9 +29,15 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--tokenizer-path", default="openai/clip-vit-base-patch32")
     result.add_argument("--rknn-backend", choices=("auto", "lite", "toolkit"), default="auto")
     result.add_argument("--rknn-target", default="rk3588")
-    result.add_argument("--yolo-core", default="0_1_2")
-    result.add_argument("--sam-encoder-core", default="0_1_2")
-    result.add_argument("--sam-decoder-core", default="0_1_2")
+    result.add_argument("--yolo-core", default="0")
+    result.add_argument("--sam-encoder-core", default="1")
+    result.add_argument("--sam-decoder-core", default="2")
+    result.add_argument(
+        "--pipeline-prefetch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Overlap next-frame RGB-D/YOLO with current-frame SAM and fusion",
+    )
     result.add_argument("--confidence", type=float, default=0.50)
     result.add_argument("--nms-threshold", type=float, default=0.45)
     result.add_argument("--mask-threshold", type=float, default=0.0)

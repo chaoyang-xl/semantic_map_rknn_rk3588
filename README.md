@@ -181,6 +181,29 @@ python3 scripts/evaluate_rknn_projection_tracking.py \
   --progress-every 10
 ```
 
+On RK3588 the offline command enables one-frame NPU pipelining by default and
+pins the three model contexts to separate cores:
+
+```text
+--pipeline-prefetch
+--yolo-core 0
+--sam-encoder-core 1
+--sam-decoder-core 2
+```
+
+The next frame is only read and detected ahead of time. SAM, projection, and
+tracking still commit frames in source order, so object identities and output
+ordering are unchanged. Use `--no-pipeline-prefetch` for serial diagnostics.
+
+OrangePi 5 Plus FP16 measurements on the first 500 Replica frames:
+
+| Mode | Elapsed | Detections | Objects |
+| --- | ---: | ---: | ---: |
+| Serial | 175.64 s | 777 | 7 |
+| NPU pipeline | 110.55 s | 777 | 7 |
+
+The association JSON and every saved object NPZ array were identical.
+
 `--frame-step 2` processes source frames `0, 2, 4, ...` while preserving
 each selected frame's original pose and file index. `--frames` still limits the number
 of processed frames; use `--frame-step 1` for the full sequence.
@@ -197,7 +220,8 @@ cat /data/semantic_05/tracking_rknn/timing.json
 
 Model loading happens before the measured interval and is intentionally excluded.
 Final object cleanup and file serialization are reported as `finalize` and
-`save`.
+`save`. With `--pipeline-prefetch`, stage work overlaps in wall-clock time;
+`overlapped_seconds` reports that overlap and stage percentages may sum above 100%.
 
 If detection JSON is absent, additionally provide:
 

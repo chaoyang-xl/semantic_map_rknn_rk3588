@@ -5,6 +5,10 @@ import numpy as np
 from semantic_map_rknn.object_tracker import (
     ObjectObservation,
     ObjectTracker,
+    GeometryIndex,
+    build_geometry_index,
+    geometry_bounds_may_overlap,
+    geometry_overlap,
     merge_voxel_clouds,
     nearest_neighbor_overlap,
     voxel_downsample_with_colors,
@@ -192,3 +196,31 @@ def test_fast_voxel_merge_matches_full_downsample():
 
     np.testing.assert_array_equal(actual_points, expected_points)
     np.testing.assert_array_equal(actual_colors, expected_colors)
+
+
+def test_geometry_bounds_rejects_pairs_beyond_overlap_radius():
+    first = build_geometry_index(observation(0, [0, 0, 1]).points)
+    second = build_geometry_index(observation(0, [1, 0, 1]).points)
+
+    assert not geometry_bounds_may_overlap(first, second, 0.06)
+
+
+def test_geometry_overlap_skips_reverse_query_after_full_overlap():
+    class Tree:
+        def __init__(self, distances):
+            self.distances = np.asarray(distances, dtype=np.float32)
+            self.calls = 0
+
+        def query(self, points, **_kwargs):
+            self.calls += 1
+            return self.distances[: len(points)], np.zeros(len(points), dtype=int)
+
+    points = np.zeros((3, 3), dtype=np.float32)
+    reverse_tree = Tree([1.0, 1.0, 1.0])
+    forward_tree = Tree([0.0, 0.0, 0.0])
+    first = GeometryIndex(points, points[0], points[0], points[0], reverse_tree)
+    second = GeometryIndex(points, points[0], points[0], points[0], forward_tree)
+
+    assert geometry_overlap(first, second, 0.04) == 1.0
+    assert forward_tree.calls == 1
+    assert reverse_tree.calls == 0

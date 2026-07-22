@@ -24,6 +24,7 @@ def test_timing_report_contains_per_call_and_per_frame_metrics(monkeypatch):
     assert elapsed == 0.125
     assert report["accounted_seconds"] == 0.125
     assert report["unaccounted_seconds"] == 0.875
+    assert report["overlapped_seconds"] == 0.0
     assert report["stages"]["sam_decoder"] == {
         "total_seconds": 0.125,
         "share_percent": 12.5,
@@ -31,3 +32,17 @@ def test_timing_report_contains_per_call_and_per_frame_metrics(monkeypatch):
         "avg_ms_per_call": 31.25,
         "avg_ms_per_frame": 62.5,
     }
+
+
+def test_timing_report_exposes_pipeline_overlap():
+    totals = {name: 0.0 for name in _ALL_TIMING_STAGES}
+    counts = {name: 0 for name in _ALL_TIMING_STAGES}
+    totals["detection"] = 0.8
+    totals["sam_encoder"] = 0.7
+    counts["detection"] = counts["sam_encoder"] = 1
+
+    report = _timing_report(totals, counts, elapsed=1.0, frame_count=1)
+
+    assert report["accounted_seconds"] == 1.5
+    assert report["unaccounted_seconds"] == 0.0
+    assert report["overlapped_seconds"] == 0.5

@@ -242,10 +242,13 @@ def geometry_overlap(
     distance_a, _ = second.tree.query(
         first.points, k=1, distance_upper_bound=radius
     )
+    overlap_a = float(np.mean(distance_a <= radius))
+    if overlap_a == 1.0:
+        return 1.0
     distance_b, _ = first.tree.query(
         second.points, k=1, distance_upper_bound=radius
     )
-    return float(max(np.mean(distance_a <= radius), np.mean(distance_b <= radius)))
+    return max(overlap_a, float(np.mean(distance_b <= radius)))
 
 
 def nearest_neighbor_overlap(
@@ -262,6 +265,16 @@ def nearest_neighbor_overlap(
         build_geometry_index(points_a),
         build_geometry_index(points_b),
         radius,
+    )
+
+
+def geometry_bounds_may_overlap(
+    first: GeometryIndex, second: GeometryIndex, margin: float
+) -> bool:
+    """Reject pairs whose expanded AABBs cannot contain nearby points."""
+    return bool(
+        np.all(first.low <= second.high + margin)
+        and np.all(second.low <= first.high + margin)
     )
 
 
@@ -456,6 +469,10 @@ class ObjectTracker:
                     > self.max_centroid_distance_m
                 ):
                     continue
+                if not geometry_bounds_may_overlap(
+                    observation_geometry, track_geometry, self.overlap_radius
+                ):
+                    continue
                 bbox = geometry_aabb_overlap(observation_geometry, track_geometry)
                 if bbox < self.min_bbox_overlap:
                     continue
@@ -594,6 +611,10 @@ class ObjectTracker:
                         first_geometry.centroid - second_geometry.centroid
                     )
                     > self.max_centroid_distance_m
+                ):
+                    continue
+                if not geometry_bounds_may_overlap(
+                    first_geometry, second_geometry, self.overlap_radius
                 ):
                     continue
                 overlap = geometry_overlap(
