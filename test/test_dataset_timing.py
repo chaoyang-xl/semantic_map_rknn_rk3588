@@ -1,6 +1,11 @@
+from concurrent.futures import Future
+
+import numpy as np
+
 from semantic_map_rknn.dataset_pipeline import (
     _ALL_TIMING_STAGES,
     _record_stage,
+    _segment_prepared_frame,
     _timing_report,
 )
 
@@ -46,3 +51,44 @@ def test_timing_report_exposes_pipeline_overlap():
     assert report["accounted_seconds"] == 1.5
     assert report["unaccounted_seconds"] == 0.0
     assert report["overlapped_seconds"] == 0.5
+
+
+def test_segment_stage_resolves_future_without_running_sam_for_empty_frame():
+    prepared = Future()
+    prepared.set_result((
+        np.zeros((4, 6, 3), dtype=np.uint8),
+        np.zeros((4, 6), dtype=np.uint16),
+        [],
+        0.01,
+        0.02,
+    ))
+
+    detections, observations, records, timings, counts = (
+        _segment_prepared_frame(
+            prepared,
+            7,
+            segmenter=None,
+            camera_scale=1000.0,
+            intrinsics=None,
+            camera_to_map=np.eye(4),
+            pixel_stride=2,
+            min_depth_m=0.3,
+            max_depth_m=5.0,
+        )
+    )
+
+    assert detections == observations == records == []
+    assert timings == {
+        "io": 0.01,
+        "detection": 0.02,
+        "sam_encoder": 0.0,
+        "sam_decoder": 0.0,
+        "projection": 0.0,
+    }
+    assert counts == {
+        "io": 1,
+        "detection": 1,
+        "sam_encoder": 0,
+        "sam_decoder": 0,
+        "projection": 0,
+    }

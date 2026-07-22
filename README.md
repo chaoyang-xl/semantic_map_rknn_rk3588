@@ -193,18 +193,22 @@ pins the three model contexts to separate cores:
 --sam-decoder-core 2
 ```
 
-The next frame is only read and detected ahead of time. SAM, projection, and
-tracking still commit frames in source order, so object identities and output
-ordering are unchanged. Use `--no-pipeline-prefetch` for serial diagnostics.
+The offline runner uses three bounded stages: RGB-D/YOLO prepares a future
+frame, SAM/projection processes the next prepared frame, and CPU fusion commits
+the current frame. Fusion remains strictly ordered, and each RKNN session is
+owned by one worker, so object identities and output ordering are unchanged.
+Use `--no-pipeline-prefetch` for serial diagnostics.
 
-OrangePi 5 Plus FP16 measurements on the first 500 Replica frames:
+OrangePi 5 Plus FP16 measurements on all 2000 Replica frames:
 
-| Mode | Elapsed | Detections | Objects |
-| --- | ---: | ---: | ---: |
-| Serial | 175.64 s | 777 | 7 |
-| NPU pipeline | 110.55 s | 777 | 7 |
+| Mode | Elapsed | Fusion work | Detections | Objects |
+| --- | ---: | ---: | ---: | ---: |
+| YOLO-only prefetch | 811.58 s | 266.65 s | 6159 | 19 |
+| Three-stage pipeline | 549.30 s | 317.87 s | 6159 | 19 |
 
-The association JSON and every saved object NPZ array were identical.
+The three-stage run overlaps 695.33 seconds of stage work. Its association JSON
+and every saved object NPZ array were identical to the YOLO-only run. SAM
+embeddings are not reused across images, so camera motion cannot stale them.
 
 `--frame-step 2` processes source frames `0, 2, 4, ...` while preserving
 each selected frame's original pose and file index. `--frames` still limits the number

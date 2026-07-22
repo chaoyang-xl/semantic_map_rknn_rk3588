@@ -36,7 +36,7 @@ def parser() -> argparse.ArgumentParser:
         "--pipeline-prefetch",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Overlap next-frame RGB-D/YOLO with current-frame SAM and fusion",
+        help="Pipeline RGB-D/YOLO, SAM/projection, and ordered CPU fusion",
     )
     result.add_argument("--confidence", type=float, default=0.50)
     result.add_argument("--nms-threshold", type=float, default=0.45)

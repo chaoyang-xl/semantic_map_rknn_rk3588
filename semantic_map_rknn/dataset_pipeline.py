@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 from pathlib import Path
 import time
@@ -148,6 +148,112 @@ def _prepare_frame(
     return image, depth, detections, io_elapsed, detection_elapsed
 
 
+def _segment_prepared_frame(
+    prepared,
+    frame_id: int,
+    *,
+    segmenter: MobileSamRknn,
+    camera_scale: float,
+    intrinsics: CameraIntrinsics,
+    camera_to_map: np.ndarray,
+    pixel_stride: int,
+    min_depth_m: float,
+    max_depth_m: float,
+):
+    """Run SAM and projection for one prepared frame in a single worker."""
+    if isinstance(prepared, Future):
+        prepared = prepared.result()
+    image, depth, detections, io_elapsed, detection_elapsed = prepared
+    timings = {
+        "io": io_elapsed,
+        "detection": detection_elapsed,
+        "sam_encoder": 0.0,
+        "sam_decoder": 0.0,
+        "projection": 0.0,
+    }
+    counts = {
+        "io": 1,
+        "detection": 1,
+        "sam_encoder": 0,
+        "sam_decoder": 0,
+        "projection": 0,
+    }
+    observations, frame_records = [], []
+    if not detections:
+        return detections, observations, frame_records, timings, counts
+
+    started = time.perf_counter()
+    segmenter.set_image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    timings["sam_encoder"] = time.perf_counter() - started
+    counts["sam_encoder"] = 1
+
+    boxes = np.asarray([item["xyxy"] for item in detections], dtype=np.float32)
+    started = time.perf_counter()
+    mask_results = segmenter.predict_boxes(boxes)
+    timings["sam_decoder"] = time.perf_counter() - started
+    counts["sam_decoder"] = len(boxes)
+
+    started = time.perf_counter()
+    depth_m = depth.astype(np.float32) / camera_scale
+    for detection_id, (detection, sam_result) in enumerate(
+        zip(detections, mask_results)
+    ):
+        mask = sam_result.mask
+        if mask.shape != depth_m.shape:
+            mask = cv2.resize(
+                mask.astype(np.uint8),
+                (depth_m.shape[1], depth_m.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+        projection = project_mask_depth(
+            depth_m,
+            mask,
+            intrinsics,
+            pixel_stride=pixel_stride,
+            min_depth_m=min_depth_m,
+            max_depth_m=max_depth_m,
+        )
+        if projection is None:
+            continue
+        points_map = _transform(projection.points_camera, camera_to_map)
+        uv = projection.image_uv
+        rgb_x = np.clip(
+            np.rint(
+                (uv[:, 0] + 0.5) * image.shape[1] / depth.shape[1] - 0.5
+            ),
+            0,
+            image.shape[1] - 1,
+        ).astype(np.int64)
+        rgb_y = np.clip(
+            np.rint(
+                (uv[:, 1] + 0.5) * image.shape[0] / depth.shape[0] - 0.5
+            ),
+            0,
+            image.shape[0] - 1,
+        ).astype(np.int64)
+        colors = image[rgb_y, rgb_x, ::-1].copy()
+        observations.append(ObjectObservation(
+            detection_id=detection_id,
+            class_id=int(detection["class_id"]),
+            class_name=str(detection["class_name"]),
+            confidence=float(detection["confidence"]),
+            stamp=float(frame_id),
+            points=points_map,
+            colors=colors,
+        ))
+        frame_records.append({
+            "frame_id": frame_id,
+            "detection_id": detection_id,
+            **detection,
+            "sam_score": sam_result.score,
+            "mask_area_pixels": int(np.count_nonzero(mask)),
+            "forward_point_count": int(points_map.shape[0]),
+        })
+    timings["projection"] = time.perf_counter() - started
+    counts["projection"] = len(mask_results)
+    return detections, observations, frame_records, timings, counts
+
+
 def save_tracks(
     output: Path, tracker: ObjectTracker, *, confirmed_only: bool = False
 ) -> list[dict]:
@@ -274,119 +380,95 @@ def run_dataset(args) -> dict:
     stage_totals = {name: 0.0 for name in _ALL_TIMING_STAGES}
     stage_counts = {name: 0 for name in _ALL_TIMING_STAGES}
     pipeline_prefetch = bool(getattr(args, "pipeline_prefetch", False))
-    executor = (
-        ThreadPoolExecutor(max_workers=1, thread_name_prefix="rknn-yolo-prefetch")
+    detection_executor = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="rknn-yolo-stage")
+        if pipeline_prefetch
+        else None
+    )
+    sam_executor = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="rknn-sam-stage")
         if pipeline_prefetch
         else None
     )
 
-    def submit_frame(position: int):
-        frame_id = frame_ids[position]
-        arguments = (data_root, frame_id, detection_paths[position])
+    def prepare_frame(position: int):
+        arguments = (
+            data_root,
+            frame_ids[position],
+            detection_paths[position],
+        )
         keywords = {
             "use_exported": use_exported,
             "detector": detector,
             "confidence": args.confidence,
         }
-        if executor is None:
+        if detection_executor is None:
             return _prepare_frame(*arguments, **keywords)
-        return executor.submit(_prepare_frame, *arguments, **keywords)
+        return detection_executor.submit(
+            _prepare_frame, *arguments, **keywords
+        )
+
+    def segment_frame(position: int, prepared):
+        return _segment_prepared_frame(
+            prepared,
+            frame_ids[position],
+            segmenter=segmenter,
+            camera_scale=float(camera.get("scale", 1000.0)),
+            intrinsics=intrinsics,
+            camera_to_map=poses[frame_ids[position]],
+            pixel_stride=args.pixel_stride,
+            min_depth_m=args.min_depth,
+            max_depth_m=args.max_depth,
+        )
 
     started = time.perf_counter()
-    pending = submit_frame(0) if executor is not None else None
+    pending_segment = None
+    next_prepared = None
+    if sam_executor is not None:
+        pending_segment = sam_executor.submit(
+            segment_frame, 0, prepare_frame(0)
+        )
+        if len(frame_ids) > 1:
+            next_prepared = prepare_frame(1)
     try:
-        for processed, frame_id in enumerate(frame_ids, start=1):
+        for position, frame_id in enumerate(frame_ids):
+            processed = position + 1
             frame_started = time.perf_counter()
             frame_stages = {name: 0.0 for name in _LOOP_TIMING_STAGES}
-            if pending is None:
-                prepared = submit_frame(processed - 1)
+            if pending_segment is None:
+                segmented = segment_frame(position, prepare_frame(position))
             else:
-                prepared = pending.result()
-                pending = (
-                    submit_frame(processed)
-                    if processed < len(frame_ids)
-                    else None
-                )
-            image, depth, detections, io_elapsed, detection_elapsed = prepared
-            frame_stages["io"] = _accumulate_stage(
-                stage_totals, stage_counts, "io", io_elapsed
-            )
-            frame_stages["detection"] = _accumulate_stage(
-                stage_totals, stage_counts, "detection", detection_elapsed
-            )
-            input_detections += len(detections)
-            observations, frame_records = [], []
-            if detections:
-                stage_started = time.perf_counter()
-                segmenter.set_image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-                frame_stages["sam_encoder"] = _record_stage(
-                    stage_totals, stage_counts, "sam_encoder", stage_started
-                )
-                boxes = np.asarray([item["xyxy"] for item in detections], dtype=np.float32)
-                stage_started = time.perf_counter()
-                mask_results = segmenter.predict_boxes(boxes)
-                frame_stages["sam_decoder"] = _record_stage(
-                    stage_totals,
-                    stage_counts,
-                    "sam_decoder",
-                    stage_started,
-                    count=len(boxes),
-                )
-                stage_started = time.perf_counter()
-                depth_m = depth.astype(np.float32) / float(camera.get("scale", 1000.0))
-                for detection_id, (detection, sam_result) in enumerate(zip(detections, mask_results)):
-                    mask = sam_result.mask
-                    if mask.shape != depth_m.shape:
-                        mask = cv2.resize(
-                            mask.astype(np.uint8),
-                            (depth_m.shape[1], depth_m.shape[0]),
-                            interpolation=cv2.INTER_NEAREST,
-                        ).astype(bool)
-                    projection = project_mask_depth(
-                        depth_m,
-                        mask,
-                        intrinsics,
-                        pixel_stride=args.pixel_stride,
-                        min_depth_m=args.min_depth,
-                        max_depth_m=args.max_depth,
+                segmented = pending_segment.result()
+                if processed < len(frame_ids):
+                    prepared = next_prepared
+                    next_prepared = (
+                        prepare_frame(position + 2)
+                        if position + 2 < len(frame_ids)
+                        else None
                     )
-                    if projection is None:
-                        continue
-                    points_map = _transform(projection.points_camera, poses[frame_id])
-                    uv = projection.image_uv
-                    rgb_x = np.clip(
-                        np.rint((uv[:, 0] + 0.5) * image.shape[1] / depth.shape[1] - 0.5),
-                        0, image.shape[1] - 1,
-                    ).astype(np.int64)
-                    rgb_y = np.clip(
-                        np.rint((uv[:, 1] + 0.5) * image.shape[0] / depth.shape[0] - 0.5),
-                        0, image.shape[0] - 1,
-                    ).astype(np.int64)
-                    colors = image[rgb_y, rgb_x, ::-1].copy()
-                    observations.append(ObjectObservation(
-                        detection_id=detection_id,
-                        class_id=int(detection["class_id"]),
-                        class_name=str(detection["class_name"]),
-                        confidence=float(detection["confidence"]),
-                        stamp=float(frame_id),
-                        points=points_map,
-                        colors=colors,
-                    ))
-                    frame_records.append({
-                        "frame_id": frame_id,
-                        "detection_id": detection_id,
-                        **detection,
-                        "sam_score": sam_result.score,
-                        "mask_area_pixels": int(np.count_nonzero(mask)),
-                        "forward_point_count": int(points_map.shape[0]),
-                    })
-                frame_stages["projection"] = _record_stage(
+                    pending_segment = sam_executor.submit(
+                        segment_frame, position + 1, prepared
+                    )
+                else:
+                    pending_segment = None
+
+            (
+                detections,
+                observations,
+                frame_records,
+                segment_timings,
+                segment_counts,
+            ) = segmented
+            for name, elapsed in segment_timings.items():
+                frame_stages[name] = _accumulate_stage(
                     stage_totals,
                     stage_counts,
-                    "projection",
-                    stage_started,
-                    count=len(mask_results),
+                    name,
+                    elapsed,
+                    count=segment_counts[name],
                 )
+            input_detections += len(detections)
+
             stage_started = time.perf_counter()
             assignments = tracker.update(observations)
             for assignment in assignments:
@@ -415,14 +497,17 @@ def run_dataset(args) -> dict:
                 print(
                     f"[{processed}/{len(frame_ids)}] frame={frame_id} "
                     f"det={len(detections)} projected={len(frame_records)} "
-                    f"tracks={len(tracker.tracks)} ETA={time.strftime('%H:%M:%S', time.gmtime(eta))} "
+                    f"tracks={len(tracker.tracks)} "
+                    f"ETA={time.strftime('%H:%M:%S', time.gmtime(eta))} "
                     f"frame_s={time.perf_counter() - frame_started:.3f} "
                     f"stage_ms[{stage_text}]",
                     flush=True,
                 )
     finally:
-        if executor is not None:
-            executor.shutdown(wait=True)
+        if sam_executor is not None:
+            sam_executor.shutdown(wait=True)
+        if detection_executor is not None:
+            detection_executor.shutdown(wait=True)
         segmenter.close()
         if detector is not None:
             detector.close()
@@ -444,6 +529,7 @@ def run_dataset(args) -> dict:
             "frame_step": frame_step,
             "frame_last": frame_ids[-1],
             "pipeline_prefetch": pipeline_prefetch,
+            "pipeline_stages": 3 if pipeline_prefetch else 1,
             "npu_core_masks": {
                 "yolo": args.yolo_core,
                 "sam_encoder": args.sam_encoder_core,
@@ -474,6 +560,7 @@ def run_dataset(args) -> dict:
         "frame_step": frame_step,
         "frame_last": frame_ids[-1],
         "pipeline_prefetch": pipeline_prefetch,
+        "pipeline_stages": 3 if pipeline_prefetch else 1,
         "npu_core_masks": {
             "yolo": args.yolo_core,
             "sam_encoder": args.sam_encoder_core,
