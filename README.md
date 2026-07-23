@@ -303,3 +303,6 @@ camera. It preserves timestamp correctness instead of building an unbounded
 queue. Offline dataset processing does not drop frames.
 
 See [INTERFACES.md](docs/INTERFACES.md) for exact topics and JSON fields.
+See [PERFORMANCE_AND_OFFLINE_DIFF.md](docs/PERFORMANCE_AND_OFFLINE_DIFF.md)
+for the complete RK3588 benchmark history and the migration diff from
+`semantic_map_offline`.
